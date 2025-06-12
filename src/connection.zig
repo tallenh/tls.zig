@@ -26,7 +26,74 @@ pub fn Connection(comptime Stream: type) type {
         read_buf: []const u8 = "",
         received_close_notify: bool = false,
 
+        // TLS notification pipe for event-driven buffered data signaling
+        notification_pipe: [2]i32 = .{ -1, -1 },
+        has_signaled: bool = false,
+
         const Self = @This();
+
+        // === TLS Notification Pipe System ===
+        // Provides event-driven signaling for TLS buffered data availability
+        // This allows integration with poll/epoll without busy polling
+
+        /// Initialize the notification pipe for TLS buffered data signaling
+        pub fn initNotificationPipe(c: *Self) !void {
+            if (std.c.pipe(&c.notification_pipe) != 0) {
+                return error.PipeCreationFailed;
+            }
+
+            // Make BOTH ends non-blocking to avoid hanging
+
+            // Write end: so signaling doesn't block
+            const write_flags = std.c.fcntl(c.notification_pipe[1], std.c.F.GETFL);
+            _ = std.c.fcntl(c.notification_pipe[1], std.c.F.SETFL, write_flags | 0x04);
+
+            // Read end: so clearing doesn't block
+            const read_flags = std.c.fcntl(c.notification_pipe[0], std.c.F.GETFL);
+            _ = std.c.fcntl(c.notification_pipe[0], std.c.F.SETFL, read_flags | 0x04);
+        }
+
+        /// Get the readable file descriptor for polling TLS buffered data
+        pub fn getNotificationFd(c: *Self) i32 {
+            return c.notification_pipe[0];
+        }
+
+        /// Signal that TLS has buffered data available
+        pub fn signalBufferedData(c: *Self) void {
+            if (c.has_signaled or c.notification_pipe[1] == -1) return;
+
+            // Write a single byte to signal data availability
+            const signal_byte = [_]u8{1};
+            _ = std.c.write(c.notification_pipe[1], &signal_byte, 1);
+            c.has_signaled = true;
+        }
+
+        /// Clear the buffered data signal (call this after consuming all buffered data)
+        pub fn clearBufferedDataSignal(c: *Self) void {
+            if (!c.has_signaled or c.notification_pipe[0] == -1) return;
+
+            // Drain the pipe to clear the signal
+            var drain_buf: [64]u8 = undefined;
+            while (std.c.read(c.notification_pipe[0], &drain_buf, drain_buf.len) > 0) {}
+            c.has_signaled = false;
+        }
+
+        /// Check if TLS has buffered data available (without blocking)
+        pub fn hasBufferedData(c: *Self) bool {
+            return c.read_buf.len > 0 or c.rec_rdr.hasMore();
+        }
+
+        /// Clean up the notification pipe
+        pub fn deinitNotificationPipe(c: *Self) void {
+            if (c.notification_pipe[0] != -1) {
+                _ = std.c.close(c.notification_pipe[0]);
+                c.notification_pipe[0] = -1;
+            }
+            if (c.notification_pipe[1] != -1) {
+                _ = std.c.close(c.notification_pipe[1]);
+                c.notification_pipe[1] = -1;
+            }
+        }
 
         /// Encrypts and writes single tls record to the stream.
         fn writeRecord(c: *Self, content_type: proto.ContentType, bytes: []const u8) !void {
@@ -185,6 +252,14 @@ pub fn Connection(comptime Stream: type) type {
             const n = @min(c.read_buf.len, buffer.len);
             @memcpy(buffer[0..n], c.read_buf[0..n]);
             c.read_buf = c.read_buf[n..];
+
+            // After consuming data, check if more buffered data remains and signal it
+            if (c.hasBufferedData()) {
+                c.signalBufferedData();
+            } else {
+                c.clearBufferedDataSignal();
+            }
+
             return n;
         }
 
