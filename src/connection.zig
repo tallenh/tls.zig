@@ -6,6 +6,9 @@ const proto = @import("protocol.zig");
 const record = @import("record.zig");
 const cipher = @import("cipher.zig");
 const Cipher = cipher.Cipher;
+const buffer_pool = @import("buffer_pool.zig");
+const signal_pipe = @import("signal_pipe.zig");
+const zero_copy = @import("zero_copy.zig");
 
 pub fn connection(stream: anytype) Connection(@TypeOf(stream)) {
     return .{
@@ -16,6 +19,9 @@ pub fn connection(stream: anytype) Connection(@TypeOf(stream)) {
 
 pub fn Connection(comptime Stream: type) type {
     return struct {
+        // Number of records to encrypt before forcing a key update
+        const key_update_seq_step = 1 << 20; // ~1 million records
+        
         stream: Stream, // underlying stream
         rec_rdr: record.Reader(Stream),
         cipher: Cipher = undefined,
@@ -26,9 +32,11 @@ pub fn Connection(comptime Stream: type) type {
         read_buf: []const u8 = "",
         received_close_notify: bool = false,
 
-        // TLS notification pipe for event-driven buffered data signaling
-        notification_pipe: [2]i32 = .{ -1, -1 },
-        has_signaled: bool = false,
+        // Optimized signal pipe for event-driven notifications
+        signal_pipe: ?signal_pipe.SignalPipe = null,
+
+        // Buffer pool for encrypt/decrypt operations
+        buffer_pool: ?*buffer_pool.BufferPool = null,
 
         const Self = @This();
 
@@ -38,44 +46,29 @@ pub fn Connection(comptime Stream: type) type {
 
         /// Initialize the notification pipe for TLS buffered data signaling
         pub fn initNotificationPipe(c: *Self) !void {
-            if (std.c.pipe(&c.notification_pipe) != 0) {
-                return error.PipeCreationFailed;
-            }
-
-            // Make BOTH ends non-blocking to avoid hanging
-
-            // Write end: so signaling doesn't block
-            const write_flags = std.c.fcntl(c.notification_pipe[1], std.c.F.GETFL);
-            _ = std.c.fcntl(c.notification_pipe[1], std.c.F.SETFL, write_flags | 0x04);
-
-            // Read end: so clearing doesn't block
-            const read_flags = std.c.fcntl(c.notification_pipe[0], std.c.F.GETFL);
-            _ = std.c.fcntl(c.notification_pipe[0], std.c.F.SETFL, read_flags | 0x04);
+            c.signal_pipe = try signal_pipe.SignalPipe.init();
         }
 
         /// Get the readable file descriptor for polling TLS buffered data
         pub fn getNotificationFd(c: *Self) i32 {
-            return c.notification_pipe[0];
+            if (c.signal_pipe) |*sp| {
+                return sp.getFd();
+            }
+            return -1;
         }
 
         /// Signal that TLS has buffered data available
         pub fn signalBufferedData(c: *Self) void {
-            if (c.has_signaled or c.notification_pipe[1] == -1) return;
-
-            // Write a single byte to signal data availability
-            const signal_byte = [_]u8{1};
-            _ = std.c.write(c.notification_pipe[1], &signal_byte, 1);
-            c.has_signaled = true;
+            if (c.signal_pipe) |*sp| {
+                sp.signal();
+            }
         }
 
         /// Clear the buffered data signal (call this after consuming all buffered data)
         pub fn clearBufferedDataSignal(c: *Self) void {
-            if (!c.has_signaled or c.notification_pipe[0] == -1) return;
-
-            // Drain the pipe to clear the signal
-            var drain_buf: [64]u8 = undefined;
-            while (std.c.read(c.notification_pipe[0], &drain_buf, drain_buf.len) > 0) {}
-            c.has_signaled = false;
+            if (c.signal_pipe) |*sp| {
+                sp.clear();
+            }
         }
 
         /// Check if TLS has buffered data available (without blocking)
@@ -85,48 +78,75 @@ pub fn Connection(comptime Stream: type) type {
 
         /// Clean up the notification pipe
         pub fn deinitNotificationPipe(c: *Self) void {
-            if (c.notification_pipe[0] != -1) {
-                _ = std.c.close(c.notification_pipe[0]);
-                c.notification_pipe[0] = -1;
-            }
-            if (c.notification_pipe[1] != -1) {
-                _ = std.c.close(c.notification_pipe[1]);
-                c.notification_pipe[1] = -1;
+            if (c.signal_pipe) |*sp| {
+                sp.deinit();
+                c.signal_pipe = null;
             }
         }
 
-        /// Encrypts and writes single tls record to the stream.
-        fn writeRecord(c: *Self, content_type: proto.ContentType, bytes: []const u8) !void {
-            assert(bytes.len <= cipher.max_cleartext_len);
-            var write_buf: [cipher.max_ciphertext_record_len]u8 = undefined;
-            // If key update is requested send key update message and update
-            // my encryption keys.
-            if (c.cipher.encryptSeq() >= c.max_encrypt_seq or @atomicLoad(bool, &c.key_update_requested, .monotonic)) {
-                @atomicStore(bool, &c.key_update_requested, false, .monotonic);
+        inline fn maybeUpdateKeys(c: *Self, write_buf: []u8) !void {
+            // Check if key update is needed (unlikely in common case)
+            const needs_update = c.cipher.encryptSeq() >= c.max_encrypt_seq or 
+                                @atomicLoad(bool, &c.key_update_requested, .monotonic);
+            
+            if (!needs_update) return;
+            
+            @atomicStore(bool, &c.key_update_requested, false, .monotonic);
 
-                // If the request_update field is set to "update_requested",
-                // then the receiver MUST send a KeyUpdate of its own with
-                // request_update set to "update_not_requested" prior to sending
-                // its next Application Data record. This mechanism allows
-                // either side to force an update to the entire connection, but
-                // causes an implementation which receives multiple KeyUpdates
-                // while it is silent to respond with a single update.
-                //
-                // rfc: https://datatracker.ietf.org/doc/html/rfc8446#autoid-57
-                const key_update = &record.handshakeHeader(.key_update, 1) ++ [_]u8{0};
-                const rec = try c.cipher.encrypt(&write_buf, .handshake, key_update);
-                try c.stream.writeAll(rec);
-                try c.cipher.keyUpdateEncrypt();
-            }
-            const rec = try c.cipher.encrypt(&write_buf, content_type, bytes);
+            // If the request_update field is set to "update_requested",
+            // then the receiver MUST send a KeyUpdate of its own with
+            // request_update set to "update_not_requested" prior to sending
+            // any of its own Application Data records.
+            // https://datatracker.ietf.org/doc/html/rfc8446#section-4.6.3
+            const key_update = &record.handshakeHeader(.key_update, 1) ++ [_]u8{0};
+            const rec = try c.cipher.encrypt(write_buf, .handshake, key_update);
             try c.stream.writeAll(rec);
+
+            // Update keys
+            try c.cipher.keyUpdateEncrypt();
+            c.max_encrypt_seq = c.cipher.encryptSeq() + key_update_seq_step;
+        }
+
+        /// Encrypts and writes single tls record to the stream.
+        inline fn writeRecord(c: *Self, content_type: proto.ContentType, bytes: []const u8) !void {
+            assert(bytes.len <= cipher.max_cleartext_len);
+            
+            // Try to use buffer pool if available, fallback to stack allocation
+            if (c.buffer_pool) |pool| {
+                const pooled_buf = try pool.acquire();
+                defer pooled_buf.deinit();
+                
+                const write_buf = pooled_buf.slice();
+                
+                // Check for key update (unlikely in common case)
+                try c.maybeUpdateKeys(write_buf);
+                const rec = try c.cipher.encrypt(write_buf, content_type, bytes);
+                try c.stream.writeAll(rec);
+            } else {
+                // Fallback to stack allocation
+                var write_buf: [cipher.max_ciphertext_record_len]u8 = undefined;
+                
+                // Check for key update (unlikely in common case)
+                try c.maybeUpdateKeys(&write_buf);
+                const rec = try c.cipher.encrypt(&write_buf, content_type, bytes);
+                try c.stream.writeAll(rec);
+            }
         }
 
         fn writeAlert(c: *Self, err: anyerror) !void {
             const cleartext = proto.alertFromError(err);
-            var buf: [128]u8 = undefined;
-            const ciphertext = try c.cipher.encrypt(&buf, .alert, &cleartext);
-            c.stream.writeAll(ciphertext) catch {};
+            
+            if (c.buffer_pool) |pool| {
+                const pooled_buf = try pool.acquire();
+                defer pooled_buf.deinit();
+                
+                const ciphertext = try c.cipher.encrypt(pooled_buf.slice(), .alert, &cleartext);
+                c.stream.writeAll(ciphertext) catch {};
+            } else {
+                var buf: [128]u8 = undefined;
+                const ciphertext = try c.cipher.encrypt(&buf, .alert, &cleartext);
+                c.stream.writeAll(ciphertext) catch {};
+            }
         }
 
         /// Returns next record of cleartext data.
@@ -209,11 +229,13 @@ pub fn Connection(comptime Stream: type) type {
                 TlsBadRecordMac,
                 TlsIllegalParameter,
                 TlsCipherNoSpaceLeft,
+                OutOfMemory,
             };
         pub const WriteError = Stream.WriteError ||
             error{
                 TlsCipherNoSpaceLeft,
                 TlsUnexpectedMessage,
+                OutOfMemory,
             };
 
         pub const Reader = std.io.Reader(*Self, ReadError, read);
@@ -495,13 +517,20 @@ pub const NonBlock = struct {
     const Self = @This();
 
     cipher: Cipher,
+    zero_copy_processor: ?zero_copy.ZeroCopyProcessor = null,
 
     pub fn init(c: Cipher) Self {
         return .{ .cipher = c };
     }
+    
+    pub fn initWithZeroCopy(c: Cipher, options: zero_copy.DecryptOptions) Self {
+        var self = Self{ .cipher = c };
+        self.zero_copy_processor = zero_copy.ZeroCopyProcessor.init(&self.cipher, options);
+        return self;
+    }
 
     /// Required ciphertext buffer length for the given cleartext length.
-    pub fn encryptedLength(self: Self, cleartext_len: usize) usize {
+    pub inline fn encryptedLength(self: Self, cleartext_len: usize) usize {
         const records_count = cleartext_len / cipher.max_cleartext_len;
         if (records_count == 0) return self.cipher.recordLen(cleartext_len);
         const last_chunk_len = cleartext_len - cipher.max_cleartext_len * records_count;
@@ -512,7 +541,7 @@ pub const NonBlock = struct {
     /// Encrypts cleartext into ciphertext.
     /// If ciphertext.len is >= encryptedLength(cleartext.len) whole
     /// cleartext will be consumed.
-    pub fn encrypt(
+    pub inline fn encrypt(
         self: *Self,
         /// Cleartext data to encrypt
         cleartext: []const u8,
@@ -549,7 +578,7 @@ pub const NonBlock = struct {
 
     /// Decrypts ciphertext into cleartext.
     /// NOTE: It is safe to reuses ciphertext buffer for cleartext data.
-    pub fn decrypt(
+    pub inline fn decrypt(
         self: *Self,
         /// Ciphertext data recieved from the other side of the tls connection
         ciphertext: []const u8,
@@ -573,12 +602,28 @@ pub const NonBlock = struct {
             const rec = (try rdr.next()) orelse break;
             if (rec.protocol_version != .tls_1_2) return error.TlsBadVersion;
 
-            // Decrypt record
-            const content_type, const cleartext_rec = try self.cipher.decrypt(cleartext[cleartext_len..], rec);
+            // Try zero-copy decrypt if enabled
+            const content_type, const cleartext_rec = if (self.zero_copy_processor) |*zcp| blk: {
+                // For zero-copy, we need mutable access to ciphertext
+                // This is safe when cleartext and ciphertext are the same buffer
+                if (@intFromPtr(ciphertext.ptr) == @intFromPtr(cleartext.ptr)) {
+                    const mutable_ct = @as([*]u8, @ptrFromInt(@intFromPtr(ciphertext.ptr)))[0..ciphertext.len];
+                    const result = try zcp.decryptRecord(mutable_ct, cleartext[cleartext_len..], rec);
+                    break :blk .{ result.content_type, result.cleartext };
+                } else {
+                    // Fall back to regular decrypt
+                    break :blk try self.cipher.decrypt(cleartext[cleartext_len..], rec);
+                }
+            } else try self.cipher.decrypt(cleartext[cleartext_len..], rec);
 
+            // Fast path for the most common case - application data
+            if (content_type == .application_data) {
+                cleartext_len += cleartext_rec.len;
+                continue;
+            }
+            
             switch (content_type) {
-                // Move cleartext pointer
-                .application_data => cleartext_len += cleartext_rec.len,
+                .application_data => unreachable, // handled above
                 .handshake => {
                     // TODO: handle key_update and new_session_ticket
                     continue;

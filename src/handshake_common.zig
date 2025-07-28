@@ -222,16 +222,15 @@ pub const CertificateBuilder = struct {
 
 pub const CertificateParser = struct {
     pub_key_algo: Certificate.Parsed.PubKeyAlgo = undefined,
-    pub_key_buf: [600]u8 = undefined,
     pub_key: []const u8 = undefined,
 
     signature_scheme: proto.SignatureScheme = @enumFromInt(0),
-    signature_buf: [1024]u8 = undefined,
     signature: []const u8 = undefined,
 
     root_ca: Certificate.Bundle,
     host: []const u8,
     skip_verify: bool = false,
+    arena: std.mem.Allocator,
     now_sec: i64 = 0,
 
     pub fn parseCertificate(h: *CertificateParser, d: *record.Decoder, tls_version: proto.Version) !void {
@@ -272,7 +271,7 @@ pub const CertificateParser = struct {
                 if (!h.skip_verify and h.host.len > 0) {
                     try subject.verifyHostName(h.host);
                 }
-                h.pub_key = dupe(&h.pub_key_buf, subject.pubKey());
+                h.pub_key = try h.arena.dupe(u8, subject.pubKey());
                 h.pub_key_algo = subject.pub_key_algo;
                 last_cert = subject;
             }
@@ -292,7 +291,8 @@ pub const CertificateParser = struct {
 
     pub fn parseCertificateVerify(h: *CertificateParser, d: *record.Decoder) !void {
         h.signature_scheme = try d.decode(proto.SignatureScheme);
-        h.signature = dupe(&h.signature_buf, try d.slice(try d.decode(u16)));
+        const sig_data = try d.slice(try d.decode(u16));
+        h.signature = try h.arena.dupe(u8, sig_data);
     }
 
     pub fn verifySignature(h: *CertificateParser, verify_bytes: []const u8) !void {

@@ -21,6 +21,13 @@ pub fn build(b: *std.Build) void {
         "client_std",
         "fuzz_server",
         "http_get_nonblock",
+        "arena_usage",
+        "buffer_pool_demo",
+        "buffer_pool_tls_demo",
+        "signal_pipe_demo",
+        "kqueue_signal_demo",
+        "zero_copy_demo",
+        "hot_path_benchmark",
     };
     inline for (examples) |path| {
         const source_file = "example/" ++ path ++ ".zig";

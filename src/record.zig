@@ -22,7 +22,7 @@ pub inline fn int3(int: u24) [3]u8 {
     return arr;
 }
 
-pub fn header(content_type: proto.ContentType, payload_len: usize) [header_len]u8 {
+pub inline fn header(content_type: proto.ContentType, payload_len: usize) [header_len]u8 {
     return [1]u8{@intFromEnum(content_type)} ++
         int2(@intFromEnum(proto.Version.tls_1_2)) ++
         int2(@intCast(payload_len));
@@ -75,7 +75,7 @@ pub fn Reader(comptime InnerReader: type) type {
             return @enumFromInt(mem.readInt(u16, buf[1..3], .big));
         }
 
-        pub fn next(r: *ReaderT) !?Record {
+        pub inline fn next(r: *ReaderT) !?Record {
             while (true) {
                 const buffer = r.buffer[r.start..r.end];
                 // If we have 5 bytes header.
@@ -133,7 +133,7 @@ pub fn Reader(comptime InnerReader: type) type {
             return r.end > r.start;
         }
 
-        pub fn bytesRead(r: *ReaderT) usize {
+        pub inline fn bytesRead(r: *ReaderT) usize {
             return r.start;
         }
     };

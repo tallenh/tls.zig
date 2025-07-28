@@ -351,7 +351,7 @@ fn Aead12ChaChaType(comptime AeadType: type) type {
         /// tls record header: 5 bytes
         /// ciphertext: same length as cleartext
         /// auth_tag: 16 bytes
-        pub fn encrypt(
+        pub inline fn encrypt(
             self: *Self,
             buf: []u8,
             content_type: proto.ContentType,
@@ -372,7 +372,7 @@ fn Aead12ChaChaType(comptime AeadType: type) type {
             return buf[0..record_len];
         }
 
-        pub fn recordLen(_: Self, cleartext_len: usize) usize {
+        pub inline fn recordLen(_: Self, cleartext_len: usize) usize {
             return record.header_len + cleartext_len + auth_tag_len;
         }
 
@@ -381,7 +381,7 @@ fn Aead12ChaChaType(comptime AeadType: type) type {
         /// Accepts tls record header and payload:
         ///   header | ----- payload -------
         ///   header | ciphertext | auth_tag
-        pub fn decrypt(
+        pub inline fn decrypt(
             self: *Self,
             buf: []u8,
             rec: Record,
@@ -492,7 +492,7 @@ fn Aead13Type(comptime AeadType: type, comptime Hash: type) type {
             return buf[0..record_len];
         }
 
-        pub fn recordLen(_: Self, cleartext_len: usize) usize {
+        pub inline fn recordLen(_: Self, cleartext_len: usize) usize {
             const payload_len = cleartext_len + 1 + auth_tag_len;
             return record.header_len + payload_len;
         }
@@ -504,7 +504,7 @@ fn Aead13Type(comptime AeadType: type, comptime Hash: type) type {
         ///   header | ciphertext     | auth_tag
         ///   header | cleartext + ct | auth_tag
         /// Ciphertext after decryption contains cleartext and content type (1 byte).
-        pub fn decrypt(
+        pub inline fn decrypt(
             self: *Self,
             buf: []u8,
             rec: Record,
@@ -530,6 +530,18 @@ fn Aead13Type(comptime AeadType: type, comptime Hash: type) type {
             self.decrypt_seq +%= 1;
             return .{ content_type, cleartext };
         }
+        
+        // Helper methods for zero-copy integration
+        pub fn getDecryptIV(self: *const Self) [nonce_len]u8 {
+            return ivWithSeq(nonce_len, self.decrypt_iv, self.decrypt_seq);
+        }
+        
+        pub fn getAeadType() type {
+            return AeadType;
+        }
+        
+        // In-place decryption for zero-copy operations
+        pub const decryptInPlace = @import("zero_copy.zig").addInPlaceDecrypt(Self).decryptInPlace;
     };
 }
 

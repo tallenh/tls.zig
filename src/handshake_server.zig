@@ -60,27 +60,26 @@ pub fn Handshake(comptime Stream: type) type {
 
         server_random: [32]u8 = undefined,
         client_random: [32]u8 = undefined,
-        legacy_session_id_buf: [32]u8 = undefined,
         legacy_session_id: []u8 = "",
         cipher_suite: CipherSuite = @enumFromInt(0),
         signature_scheme: proto.SignatureScheme = @enumFromInt(0),
         named_group: proto.NamedGroup = @enumFromInt(0),
-        client_pub_key_buf: [max_pub_key_len]u8 = undefined,
         client_pub_key: []u8 = "",
-        server_pub_key_buf: [max_pub_key_len]u8 = undefined,
         server_pub_key: []u8 = "",
 
         cipher: Cipher = undefined,
         transcript: Transcript = .{},
         rec_rdr: *RecordReaderT,
         buffer: []u8,
+        arena: mem.Allocator,
 
         const HandshakeT = @This();
 
-        pub fn init(buf: []u8, rec_rdr: *RecordReaderT) HandshakeT {
+        pub fn init(buf: []u8, rec_rdr: *RecordReaderT, arena: mem.Allocator) HandshakeT {
             return .{
                 .rec_rdr = rec_rdr,
                 .buffer = buf,
+                .arena = arena,
             };
         }
 
@@ -199,7 +198,7 @@ pub fn Handshake(comptime Stream: type) type {
             var seed: [DhKeyPair.seed_len]u8 = undefined;
             crypto.random.bytes(&seed);
             var kp = try DhKeyPair.init(seed, supported_named_groups);
-            h.server_pub_key = dupe(&h.server_pub_key_buf, try kp.publicKey(h.named_group));
+            h.server_pub_key = try h.arena.dupe(u8, try kp.publicKey(h.named_group));
             return try kp.sharedKey(h.named_group, h.client_pub_key);
         }
 
@@ -210,7 +209,7 @@ pub fn Handshake(comptime Stream: type) type {
             var handshake_state: proto.Handshake = .finished;
             var crt_parser: CertificateParser = undefined;
             if (opt.client_auth) |client_auth| {
-                crt_parser = .{ .root_ca = client_auth.root_ca, .host = "" };
+                crt_parser = .{ .root_ca = client_auth.root_ca, .host = "", .arena = h.arena };
                 handshake_state = .certificate;
             }
 
@@ -380,7 +379,8 @@ pub fn Handshake(comptime Stream: type) type {
             h.client_random = try d.array(32);
             { // legacy session id
                 const len = try d.decode(u8);
-                h.legacy_session_id = dupe(&h.legacy_session_id_buf, try d.slice(len));
+                const session_id = try d.slice(len);
+                h.legacy_session_id = try h.arena.dupe(u8, session_id);
             }
             { // cipher suites
                 const end_idx = try d.decode(u16) + d.idx;
@@ -434,7 +434,7 @@ pub fn Handshake(comptime Stream: type) type {
                             for (supported_named_groups, 0..) |supported, idx| {
                                 if (named_group == supported and idx < selected_named_group_idx) {
                                     h.named_group = named_group;
-                                    h.client_pub_key = dupe(&h.client_pub_key_buf, client_pub_key);
+                                    h.client_pub_key = try h.arena.dupe(u8, client_pub_key);
                                     selected_named_group_idx = idx;
                                 }
                             }
@@ -491,9 +491,12 @@ fn testReader(data: []const u8) record.Reader(std.io.FixedBufferStream([]const u
 const TestHandshake = Handshake(std.io.FixedBufferStream([]const u8));
 
 test "read client hello" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    
     var buffer: [1024]u8 = undefined;
     var rec_rdr = testReader(&data13.client_hello);
-    var h = TestHandshake.init(&buffer, &rec_rdr);
+    var h = TestHandshake.init(&buffer, &rec_rdr, arena.allocator());
     h.signature_scheme = .ecdsa_secp521r1_sha512; // this must be supported in signature_algorithms extension
     try h.readClientHello();
 
@@ -504,13 +507,17 @@ test "read client hello" {
 }
 
 test "make server hello" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    
     var buffer: [128]u8 = undefined;
-    var h = TestHandshake.init(&buffer, undefined);
+    var h = TestHandshake.init(&buffer, undefined, arena.allocator());
     h.cipher_suite = .AES_256_GCM_SHA384;
     testu.fillFrom(&h.server_random, 0);
-    testu.fillFrom(&h.server_pub_key_buf, 0x20);
+    var pub_key_buf: [32]u8 = undefined;
+    testu.fillFrom(&pub_key_buf, 0x20);
     h.named_group = .x25519;
-    h.server_pub_key = h.server_pub_key_buf[0..32];
+    h.server_pub_key = &pub_key_buf;
 
     const actual = try h.makeServerHello(&buffer);
     const expected = &testu.hexToBytes(
@@ -548,6 +555,8 @@ pub const NonBlock = struct {
     inner: Inner = undefined,
     opt: Options = undefined,
     state: State = .none,
+    arena: std.heap.ArenaAllocator = undefined,
+    arena_initialized: bool = false,
 
     const State = enum {
         none,
@@ -562,11 +571,8 @@ pub const NonBlock = struct {
     };
 
     pub fn init(opt: Options) Self {
-        var inner = Inner.init(undefined, undefined);
-        inner.initKeys(opt);
         return .{
             .opt = opt,
-            .inner = inner,
             .state = .init,
         };
     }
@@ -636,6 +642,16 @@ pub const NonBlock = struct {
             .unused_recv = &.{},
             .send = &.{},
         };
+        
+        // Initialize arena and inner on first run
+        if (!self.arena_initialized) {
+            self.arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+            self.arena_initialized = true;
+            var rec_rdr: record.Reader([]const u8) = undefined;
+            self.inner = Inner.init(send_buf, &rec_rdr, self.arena.allocator());
+            self.inner.initKeys(self.opt);
+        }
+        
         self.inner.buffer = send_buf;
 
         const recv_pos = self.recv(recv_buf) catch |err| switch (err) {
@@ -655,5 +671,12 @@ pub const NonBlock = struct {
     /// Cipher produced in handshake, null until successful handshake.
     pub fn cipher(self: Self) ?Cipher {
         return if (self.done()) self.inner.cipher else null;
+    }
+    
+    pub fn deinit(self: *Self) void {
+        if (self.arena_initialized) {
+            self.arena.deinit();
+            self.arena_initialized = false;
+        }
     }
 };

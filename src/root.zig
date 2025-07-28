@@ -8,13 +8,56 @@ pub const max_ciphertext_record_len = @import("cipher.zig").max_ciphertext_recor
 const Client = @import("handshake_client.zig").Handshake;
 const Server = @import("handshake_server.zig").Handshake;
 pub const Connection = @import("connection.zig").Connection;
+pub const ArenaPool = @import("arena_pool.zig").ArenaPool;
+pub const ScopedArena = @import("arena_pool.zig").ScopedArena;
+pub const BufferPool = @import("buffer_pool.zig").BufferPool;
+pub const PooledBuffer = @import("buffer_pool.zig").PooledBuffer;
+pub const ThreadLocalPool = @import("buffer_pool.zig").ThreadLocalPool;
+pub const buffer_pool = @import("buffer_pool.zig");
+pub const SignalPipe = @import("signal_pipe.zig").SignalPipe;
+pub const OptionalSignalPipe = @import("signal_pipe.zig").OptionalSignalPipe;
+pub const ZeroCopyProcessor = @import("zero_copy.zig").ZeroCopyProcessor;
+pub const DecryptOptions = @import("zero_copy.zig").DecryptOptions;
 
 /// Upgrades existing stream to the tls connection by the client tls handshake.
 pub fn client(stream: anytype, opt: config.Client) !Connection(@TypeOf(stream)) {
     const Stream = @TypeOf(stream);
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+    
     var conn = connection(stream);
     var write_buf: [max_ciphertext_record_len]u8 = undefined;
-    var cli = Client(Stream).init(&write_buf, &conn.rec_rdr);
+    var cli = Client(Stream).init(&write_buf, &conn.rec_rdr, arena.allocator());
+    conn.cipher = try cli.handshake(conn.stream, opt);
+    return conn;
+}
+
+/// Client handshake with arena allocator for reduced memory allocation overhead
+pub fn clientWithArena(stream: anytype, opt: config.Client, arena_pool: *ArenaPool) !Connection(@TypeOf(stream)) {
+    const Stream = @TypeOf(stream);
+    var scoped = try ScopedArena.init(arena_pool);
+    defer scoped.deinit();
+    
+    var conn = connection(stream);
+    var write_buf: [max_ciphertext_record_len]u8 = undefined;
+    var cli = Client(Stream).init(&write_buf, &conn.rec_rdr, scoped.allocator());
+    conn.cipher = try cli.handshake(conn.stream, opt);
+    return conn;
+}
+
+/// Client handshake with both arena and buffer pools for optimal performance
+pub fn clientWithPools(stream: anytype, opt: config.Client, arena_pool: *ArenaPool, buf_pool: *BufferPool) !Connection(@TypeOf(stream)) {
+    const Stream = @TypeOf(stream);
+    var scoped = try ScopedArena.init(arena_pool);
+    defer scoped.deinit();
+    
+    var conn = connection(stream);
+    conn.buffer_pool = buf_pool;
+    
+    const pooled_buf = try buf_pool.acquire();
+    defer pooled_buf.deinit();
+    
+    var cli = Client(Stream).init(pooled_buf.slice(), &conn.rec_rdr, scoped.allocator());
     conn.cipher = try cli.handshake(conn.stream, opt);
     return conn;
 }
@@ -22,9 +65,42 @@ pub fn client(stream: anytype, opt: config.Client) !Connection(@TypeOf(stream)) 
 /// Upgrades existing stream to the tls connection by the server side tls handshake.
 pub fn server(stream: anytype, opt: config.Server) !Connection(@TypeOf(stream)) {
     const Stream = @TypeOf(stream);
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+    
     var conn = connection(stream);
     var write_buf: [max_ciphertext_record_len]u8 = undefined;
-    var srv = Server(Stream).init(&write_buf, &conn.rec_rdr);
+    var srv = Server(Stream).init(&write_buf, &conn.rec_rdr, arena.allocator());
+    conn.cipher = try srv.handshake(conn.stream, opt);
+    return conn;
+}
+
+/// Server handshake with arena allocator for reduced memory allocation overhead
+pub fn serverWithArena(stream: anytype, opt: config.Server, arena_pool: *ArenaPool) !Connection(@TypeOf(stream)) {
+    const Stream = @TypeOf(stream);
+    var scoped = try ScopedArena.init(arena_pool);
+    defer scoped.deinit();
+    
+    var conn = connection(stream);
+    var write_buf: [max_ciphertext_record_len]u8 = undefined;
+    var srv = Server(Stream).init(&write_buf, &conn.rec_rdr, scoped.allocator());
+    conn.cipher = try srv.handshake(conn.stream, opt);
+    return conn;
+}
+
+/// Server handshake with both arena and buffer pools for optimal performance
+pub fn serverWithPools(stream: anytype, opt: config.Server, arena_pool: *ArenaPool, buf_pool: *BufferPool) !Connection(@TypeOf(stream)) {
+    const Stream = @TypeOf(stream);
+    var scoped = try ScopedArena.init(arena_pool);
+    defer scoped.deinit();
+    
+    var conn = connection(stream);
+    conn.buffer_pool = buf_pool;
+    
+    const pooled_buf = try buf_pool.acquire();
+    defer pooled_buf.deinit();
+    
+    var srv = Server(Stream).init(pooled_buf.slice(), &conn.rec_rdr, scoped.allocator());
     conn.cipher = try srv.handshake(conn.stream, opt);
     return conn;
 }

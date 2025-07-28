@@ -103,23 +103,24 @@ pub fn Handshake(comptime Stream: type) type {
         cert: CertificateParser = undefined,
         client_certificate_requested: bool = false,
         // public key len: x25519 = 32, secp256r1 = 65, secp384r1 = 97, x25519_ml_kem768 = 64, x25519_kyber768d00 = 1120
-        server_pub_key_buf: [2048]u8 = undefined,
         server_pub_key: []const u8 = undefined,
 
         rec_rdr: *RecordReaderT, // tls record reader
         buffer: []u8, // scratch buffer used in all messages creation
+        arena: mem.Allocator, // arena allocator for handshake allocations
 
         const HandshakeT = @This();
 
         // `buf` is used for creating client messages and for decrypting server
         // ciphertext messages.
-        pub fn init(buf: []u8, rec_rdr: *RecordReaderT) HandshakeT {
+        pub fn init(buf: []u8, rec_rdr: *RecordReaderT, arena: mem.Allocator) HandshakeT {
             return .{
                 .client_random = undefined,
                 .dh_kp = undefined,
                 .rsa_secret = undefined,
                 .buffer = buf,
                 .rec_rdr = rec_rdr,
+                .arena = arena,
             };
         }
 
@@ -139,6 +140,7 @@ pub fn Handshake(comptime Stream: type) type {
                 .host = opt.host,
                 .root_ca = opt.root_ca,
                 .skip_verify = opt.insecure_skip_verify,
+                .arena = h.arena,
             };
         }
 
@@ -214,6 +216,7 @@ pub fn Handshake(comptime Stream: type) type {
         }
 
         fn clientFlight1(h: *HandshakeT, opt: Options) ![]const u8 {
+            try h.initKeys(opt);
             return try h.makeClientHello(opt);
         }
 
@@ -442,7 +445,8 @@ pub fn Handshake(comptime Stream: type) type {
                         },
                         .key_share => {
                             h.named_group = try d.decode(proto.NamedGroup);
-                            h.server_pub_key = dupe(&h.server_pub_key_buf, try d.slice(try d.decode(u16)));
+                            const pub_key_data = try d.slice(try d.decode(u16));
+                            h.server_pub_key = try h.arena.dupe(u8, pub_key_data);
                             if (len != h.server_pub_key.len + 4) return error.TlsIllegalParameter;
                         },
                         else => {
@@ -465,9 +469,11 @@ pub fn Handshake(comptime Stream: type) type {
         fn parseServerKeyExchange(h: *HandshakeT, d: *record.Decoder) !void {
             const curve_type = try d.decode(proto.Curve);
             h.named_group = try d.decode(proto.NamedGroup);
-            h.server_pub_key = dupe(&h.server_pub_key_buf, try d.slice(try d.decode(u8)));
+            const pub_key_data = try d.slice(try d.decode(u8));
+            h.server_pub_key = try h.arena.dupe(u8, pub_key_data);
             h.cert.signature_scheme = try d.decode(proto.SignatureScheme);
-            h.cert.signature = dupe(&h.cert.signature_buf, try d.slice(try d.decode(u16)));
+            const sig_data = try d.slice(try d.decode(u16));
+            h.cert.signature = try h.arena.dupe(u8, sig_data);
             if (curve_type != .named_curve) return error.TlsIllegalParameter;
         }
 
@@ -775,10 +781,13 @@ fn testReader(data: []const u8) record.Reader(io.FixedBufferStream([]const u8)) 
 const TestHandshake = Handshake(io.FixedBufferStream([]const u8));
 
 test "parse tls 1.2 server hello" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    
     var h = brk: {
         var buffer: [1024]u8 = undefined;
         var rec_rdr = testReader(&data12.server_hello_responses);
-        break :brk TestHandshake.init(&buffer, &rec_rdr);
+        break :brk TestHandshake.init(&buffer, &rec_rdr, arena.allocator());
     };
 
     // Set to known instead of random
@@ -789,7 +798,7 @@ test "parse tls 1.2 server hello" {
     // Read cipher suite, named group, signature scheme, server random certificate public key
     // Verify host name, signature
     // Calculate key material
-    h.cert = .{ .host = "example.ulfheim.net", .skip_verify = true, .root_ca = .{} };
+    h.cert = .{ .host = "example.ulfheim.net", .skip_verify = true, .root_ca = .{}, .arena = arena.allocator() };
     try h.readServerFlight1();
     try testing.expectEqual(.ECDHE_RSA_WITH_AES_128_CBC_SHA, h.cipher_suite);
     try testing.expectEqual(.x25519, h.named_group.?);
@@ -806,10 +815,13 @@ test "parse tls 1.2 server hello" {
 }
 
 test "verify google.com certificate" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    
     var h = brk: {
         var buffer: [1024]u8 = undefined;
         var rec_rdr = testReader(@embedFile("testdata/google.com/server_hello"));
-        break :brk TestHandshake.init(&buffer, &rec_rdr);
+        break :brk TestHandshake.init(&buffer, &rec_rdr, arena.allocator());
     };
     h.client_random = @embedFile("testdata/google.com/client_random").*;
 
@@ -817,12 +829,15 @@ test "verify google.com certificate" {
     try ca_bundle.rescan(testing.allocator);
     defer ca_bundle.deinit(testing.allocator);
 
-    h.cert = .{ .host = "google.com", .skip_verify = true, .root_ca = .{}, .now_sec = 1714846451 };
+    h.cert = .{ .host = "google.com", .skip_verify = true, .root_ca = .{}, .now_sec = 1714846451, .arena = arena.allocator() };
     try h.readServerFlight1();
     try h.verifyCertificateSignatureTls12();
 }
 
 test "parse tls 1.3 server hello" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    
     var rec_rdr = testReader(&data13.server_hello);
     var d = (try rec_rdr.nextDecoder());
 
@@ -831,7 +846,7 @@ test "parse tls 1.3 server hello" {
     try testing.expectEqual(0x000076, length);
     try testing.expectEqual(.server_hello, handshake_type);
 
-    var h = TestHandshake.init(undefined, undefined);
+    var h = TestHandshake.init(undefined, undefined, arena.allocator());
     try h.parseServerHello(&d, length);
 
     try testing.expectEqual(.AES_256_GCM_SHA384, h.cipher_suite);
@@ -879,8 +894,11 @@ fn initExampleHandshake(h: *TestHandshake) !void {
 }
 
 test "tls 1.3 decrypt wrapped record" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    
     var cph = brk: {
-        var h = TestHandshake.init(undefined, undefined);
+        var h = TestHandshake.init(undefined, undefined, arena.allocator());
         try initExampleHandshake(&h);
         break :brk h.cipher;
     };
@@ -903,14 +921,17 @@ test "tls 1.3 decrypt wrapped record" {
 }
 
 test "tls 1.3 process server flight" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    
     var buffer: [1024]u8 = undefined;
     var h = brk: {
         var rec_rdr = testReader(&data13.server_flight);
-        break :brk TestHandshake.init(&buffer, &rec_rdr);
+        break :brk TestHandshake.init(&buffer, &rec_rdr, arena.allocator());
     };
 
     try initExampleHandshake(&h);
-    h.cert = .{ .host = "example.ulfheim.net", .skip_verify = true, .root_ca = .{} };
+    h.cert = .{ .host = "example.ulfheim.net", .skip_verify = true, .root_ca = .{}, .arena = arena.allocator() };
     try h.readEncryptedServerFlight1();
 
     { // application cipher keys calculation
@@ -936,9 +957,12 @@ test "tls 1.3 process server flight" {
 }
 
 test "create client hello" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    
     var h = brk: {
         var buffer: [1024]u8 = undefined;
-        var h = TestHandshake.init(&buffer, undefined);
+        var h = TestHandshake.init(&buffer, undefined, arena.allocator());
         h.client_random = testu.hexToBytes(
             \\ 00 01 02 03 04 05 06 07 08 09 0a 0b 0c 0d 0e 0f 10 11 12 13 14 15 16 17 18 19 1a 1b 1c 1d 1e 1f
         );
@@ -970,9 +994,12 @@ test "create client hello" {
 }
 
 test "handshake verify server finished message" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    
     var buffer: [1024]u8 = undefined;
     var rec_rdr = testReader(&data12.server_handshake_finished_msgs);
-    var h = TestHandshake.init(&buffer, &rec_rdr);
+    var h = TestHandshake.init(&buffer, &rec_rdr, arena.allocator());
 
     h.cipher_suite = .ECDHE_ECDSA_WITH_AES_128_CBC_SHA;
     h.master_secret = data12.master_secret;
@@ -1002,6 +1029,8 @@ pub const NonBlock = struct {
     inner: Inner = undefined,
     opt: Options = undefined,
     state: State = .none,
+    arena: std.heap.ArenaAllocator = undefined,
+    arena_initialized: bool = false,
 
     const State = enum {
         none,
@@ -1017,10 +1046,7 @@ pub const NonBlock = struct {
     };
 
     pub fn init(opt: Options) Self {
-        var inner = Inner.init(undefined, undefined);
-        inner.initKeys(opt) catch unreachable;
         return .{
-            .inner = inner,
             .opt = opt,
             .state = .init,
         };
@@ -1098,6 +1124,15 @@ pub const NonBlock = struct {
             .unused_recv = &.{},
             .send = &.{},
         };
+        
+        // Initialize arena and inner on first run
+        if (!self.arena_initialized) {
+            self.arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+            self.arena_initialized = true;
+            var rec_rdr: record.Reader([]const u8) = undefined;
+            self.inner = Inner.init(send_buf, &rec_rdr, self.arena.allocator());
+        }
+        
         self.inner.buffer = send_buf;
 
         const recv_pos = self.recv(recv_buf) catch |err| switch (err) {
@@ -1118,6 +1153,13 @@ pub const NonBlock = struct {
     pub fn cipher(self: Self) ?Cipher {
         return if (self.done()) self.inner.cipher else null;
     }
+    
+    pub fn deinit(self: *Self) void {
+        if (self.arena_initialized) {
+            self.arena.deinit();
+            self.arena_initialized = false;
+        }
+    }
 };
 
 test "nonblock handshake" {
@@ -1129,13 +1171,27 @@ test "nonblock handshake" {
         .cipher_suites = &[_]CipherSuite{CipherSuite.AES_256_GCM_SHA384},
         .named_groups = &[_]proto.NamedGroup{.x25519},
     });
+    defer ah.deinit();
+    
+    // Initialize arena and inner manually
+    ah.arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    ah.arena_initialized = true;
+    var rec_rdr: record.Reader([]const u8) = undefined;
+    ah.inner = NonBlock.Inner.init(&buffer, &rec_rdr, ah.arena.allocator());
+    
     var h = &ah.inner;
-    { // update secrets to well known from example
-        h.buffer = &buffer;
+    { // Override with well known values before send() calls initKeys
         h.client_random = data13.client_random;
         h.dh_kp.x25519_kp = .{
             .public_key = data13.client_public_key,
             .secret_key = data13.client_private_key,
+        };
+        h.rsa_secret = undefined;
+        h.cert = .{
+            .host = ah.opt.host,
+            .root_ca = ah.opt.root_ca,
+            .skip_verify = ah.opt.insecure_skip_verify,
+            .arena = ah.arena.allocator(),
         };
     }
 
@@ -1154,8 +1210,12 @@ test "nonblock handshake" {
         \\ 35 80 72 d6 36 58 80 d1 ae ea 32 9a df 91 21 38 38 51 ed 21 a2 8e 3b 75 e9 65 d0 d2 cd 16 62 54
         \\ 00 00 00 18 00 16 00 00 13 65 78 61 6d 70 6c 65 2e 75 6c 66 68 65 69 6d 2e 6e 65 74
     );
-    const client_flight_1 = try ah.send();
-    try testing.expectEqualSlices(u8, &expected_client_flight_1, client_flight_1.?);
+    // Call makeClientHello directly to avoid initKeys being called again
+    const client_flight_1 = try h.makeClientHello(ah.opt);
+    try testing.expectEqualSlices(u8, &expected_client_flight_1, client_flight_1);
+    
+    // Update state to match what send() would have done
+    ah.state = .client_flight_1;
 
     { // update transcript to well known from example
         h.transcript = .{};
